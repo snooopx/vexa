@@ -15,10 +15,20 @@ submodules:
 
 BOT_IMAGE_NAME ?= vexa-bot:dev
 
+# Compose CLI prefix ("docker compose" or "docker-compose"). Not named DOCKER_COMPOSE: Make imports
+# the environment and DOCKER_COMPOSE=docker is common, which turns the compose build step into
+# "docker -f docker-compose.yml …" → Docker exits 125 (unknown shorthand flag: 'f' in -f).
+VEXA_COMPOSE ?= docker compose
+
 # Check if Docker daemon is running
 check_docker:
 	@if ! docker info > /dev/null 2>&1; then \
 		echo "ERROR: Docker is not running. Please start Docker Desktop or Docker daemon first."; \
+		exit 1; \
+	fi
+	@if ! $(VEXA_COMPOSE) version >/dev/null 2>&1; then \
+		echo "ERROR: Docker Compose not working as: $(VEXA_COMPOSE)"; \
+		echo "Try: $(VEXA_COMPOSE) version   or   make build VEXA_COMPOSE=docker-compose"; \
 		exit 1; \
 	fi
 
@@ -203,9 +213,9 @@ build-transcription-service: check_docker
 	@if [ "$(TRANSCRIPTION)" = "remote" ]; then \
 		exit 0; \
 	elif [ "$(TRANSCRIPTION)" = "cpu" ]; then \
-		cd services/transcription-service && docker compose -f docker-compose.cpu.yml build; \
+		cd services/transcription-service && $(VEXA_COMPOSE) -f docker-compose.cpu.yml build; \
 	elif [ "$(TRANSCRIPTION)" = "gpu" ]; then \
-		cd services/transcription-service && docker compose build; \
+		cd services/transcription-service && $(VEXA_COMPOSE) build; \
 	fi
 
 # Build Docker Compose service images
@@ -215,22 +225,22 @@ build: check_docker build-bot-image build-transcription-service
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
 	fi; \
-	docker compose $$COMPOSE_FILES --profile remote build
+	$(VEXA_COMPOSE) $$COMPOSE_FILES --profile remote build
 
 # Start transcription-service based on TRANSCRIPTION
 up-transcription-service: check_docker
 	@if [ "$(TRANSCRIPTION)" = "remote" ]; then \
 		exit 0; \
 	elif [ "$(TRANSCRIPTION)" = "cpu" ]; then \
-		cd services/transcription-service && docker compose -f docker-compose.cpu.yml up -d; \
+		cd services/transcription-service && $(VEXA_COMPOSE) -f docker-compose.cpu.yml up -d; \
 	elif [ "$(TRANSCRIPTION)" = "gpu" ]; then \
-		cd services/transcription-service && docker compose up -d; \
+		cd services/transcription-service && $(VEXA_COMPOSE) up -d; \
 	fi
 
 # Stop transcription-service
 down-transcription-service: check_docker
-	@cd services/transcription-service && docker compose -f docker-compose.cpu.yml down 2>/dev/null || true
-	@cd services/transcription-service && docker compose down 2>/dev/null || true
+	@cd services/transcription-service && $(VEXA_COMPOSE) -f docker-compose.cpu.yml down 2>/dev/null || true
+	@cd services/transcription-service && $(VEXA_COMPOSE) down 2>/dev/null || true
 
 # Start services in detached mode
 up: check_docker
@@ -246,16 +256,16 @@ up: check_docker
 		echo "Creating vexa-network..."; \
 		docker network create vexa-network || true; \
 	fi; \
-	docker compose $$COMPOSE_FILES --profile remote up -d; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES --profile remote up -d; \
 	sleep 3; \
 	if [ "$$REMOTE_DB" = "true" ]; then \
-		if docker compose $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
+		if $(VEXA_COMPOSE) $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
 			echo "WARNING: postgres container is running but REMOTE_DB=true"; \
 			exit 1; \
 		fi; \
 	else \
-		if ! docker compose $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
-			echo "ERROR: postgres container failed to start. Check logs with: docker compose $$COMPOSE_FILES logs postgres"; \
+		if ! $(VEXA_COMPOSE) $$COMPOSE_FILES ps -q postgres 2>/dev/null | grep -q .; then \
+			echo "ERROR: postgres container failed to start. Check logs with: $(VEXA_COMPOSE) $$COMPOSE_FILES logs postgres"; \
 			exit 1; \
 		fi; \
 		echo "✓ Local postgres container is running"; \
@@ -268,7 +278,7 @@ down: check_docker down-transcription-service
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
 	fi; \
-	docker compose $$COMPOSE_FILES down
+	$(VEXA_COMPOSE) $$COMPOSE_FILES down
 
 # Show container status
 ps: check_docker
@@ -277,7 +287,7 @@ ps: check_docker
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
 	fi; \
-	docker compose $$COMPOSE_FILES ps
+	$(VEXA_COMPOSE) $$COMPOSE_FILES ps
 
 # Tail logs for all services
 logs:
@@ -286,7 +296,7 @@ logs:
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
 	fi; \
-	docker compose $$COMPOSE_FILES logs -f
+	$(VEXA_COMPOSE) $$COMPOSE_FILES logs -f
 
 # Run the interaction test script
 test: check_docker
@@ -355,12 +365,12 @@ migrate-or-init: check_docker
 	[ -n "$$DB_NAME" ] || DB_NAME="vexa"; \
 	[ -n "$$DB_USER" ] || DB_USER="postgres"; \
 	if [ "$$REMOTE_DB" != "true" ]; then \
-		if ! docker compose $$COMPOSE_FILES ps -q postgres | grep -q .; then \
+		if ! $(VEXA_COMPOSE) $$COMPOSE_FILES ps -q postgres | grep -q .; then \
 			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
 			exit 1; \
 		fi; \
 		count=0; \
-		while ! docker compose $$COMPOSE_FILES exec -T postgres pg_isready -U $$DB_USER -d $$DB_NAME -q; do \
+		while ! $(VEXA_COMPOSE) $$COMPOSE_FILES exec -T postgres pg_isready -U $$DB_USER -d $$DB_NAME -q; do \
 			if [ $$count -ge 12 ]; then \
 				echo "ERROR: Database did not become ready in 60 seconds."; \
 				exit 1; \
@@ -368,22 +378,22 @@ migrate-or-init: check_docker
 			sleep 5; \
 			count=$$((count+1)); \
 		done; \
-		docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		HAS_ALEMBIC_TABLE=$$(docker compose $$COMPOSE_FILES exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version';" 2>/dev/null | tr -d '[:space:]' || echo ""); \
+		$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
+		HAS_ALEMBIC_TABLE=$$($(VEXA_COMPOSE) $$COMPOSE_FILES exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.tables WHERE table_name = 'alembic_version';" 2>/dev/null | tr -d '[:space:]' || echo ""); \
 		if [ "$$HAS_ALEMBIC_TABLE" = "1" ]; then \
 			$(MAKE) migrate; \
 		else \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
+			$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
+			$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
 		fi; \
 	else \
-		docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		DB_STATE=$$(docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/check_db_state.py 2>/dev/null || echo "fresh"); \
+		$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
+		DB_STATE=$$($(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/check_db_state.py 2>/dev/null || echo "fresh"); \
 		if [ "$$DB_STATE" = "alembic" ]; then \
 			$(MAKE) migrate; \
 		else \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-			docker compose $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
+			$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
+			$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --create-if-missing; \
 		fi; \
 	fi
 
@@ -391,7 +401,7 @@ migrate-or-init: check_docker
 migrate: check_docker
 	@REMOTE_DB=$$(grep -E '^[[:space:]]*REMOTE_DB=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' | tr '[:upper:]' '[:lower:]' || echo "false"); \
 	if [ "$$REMOTE_DB" != "true" ]; then \
-		if ! docker compose -f docker-compose.yml -f docker-compose.local-db.yml ps postgres | grep -q "Up"; then \
+		if ! $(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml ps postgres | grep -q "Up"; then \
 			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
 			exit 1; \
 		fi; \
@@ -399,16 +409,16 @@ migrate: check_docker
 		DB_NAME=$$(grep -E '^[[:space:]]*DB_NAME=' .env 2>/dev/null | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' || echo "vexa"); \
 		[ -n "$$DB_USER" ] || DB_USER="postgres"; \
 		[ -n "$$DB_NAME" ] || DB_NAME="vexa"; \
-		docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
-		current_version=$$(docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini current 2>/dev/null | grep -E '^[a-f0-9]{12}' | head -1 || echo ""); \
+		$(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector python /app/libs/shared-models/fix_alembic_version.py --repair-stale; \
+		current_version=$$($(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini current 2>/dev/null | grep -E '^[a-f0-9]{12}' | head -1 || echo ""); \
 		if [ "$$current_version" = "dc59a1c03d1f" ]; then \
-			if docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'data';" | grep -q 1; then \
-				docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini stamp 5befe308fa8b; \
+			if $(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml exec -T postgres psql -U $$DB_USER -d $$DB_NAME -t -c "SELECT 1 FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'data';" | grep -q 1; then \
+				$(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini stamp 5befe308fa8b; \
 			fi; \
 		fi; \
-		docker compose -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
+		$(VEXA_COMPOSE) -f docker-compose.yml -f docker-compose.local-db.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
 	else \
-		docker compose -f docker-compose.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
+		$(VEXA_COMPOSE) -f docker-compose.yml exec -T transcription-collector alembic -c /app/alembic.ini upgrade head; \
 	fi
 
 # Create a new migration file
@@ -421,12 +431,12 @@ makemigrations: check_docker
 	COMPOSE_FILES="-f docker-compose.yml"; \
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
+		if ! $(VEXA_COMPOSE) $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
 			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
 			exit 1; \
 		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini revision --autogenerate -m "$(M)"
+	fi; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini revision --autogenerate -m "$(M)"
 
 # Initialize the database
 init-db: check_docker
@@ -435,8 +445,8 @@ init-db: check_docker
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
 	fi; \
-	docker compose $$COMPOSE_FILES run --rm transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
-	docker compose $$COMPOSE_FILES run --rm transcription-collector alembic -c /app/alembic.ini stamp head
+	$(VEXA_COMPOSE) $$COMPOSE_FILES run --rm transcription-collector python -c "import asyncio; from shared_models.database import init_db; asyncio.run(init_db())"; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES run --rm transcription-collector alembic -c /app/alembic.ini stamp head
 
 # Stamp existing database with current version
 stamp-db: check_docker
@@ -444,12 +454,12 @@ stamp-db: check_docker
 	COMPOSE_FILES="-f docker-compose.yml"; \
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
+		if ! $(VEXA_COMPOSE) $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
 			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
 			exit 1; \
 		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini stamp head
+	fi; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini stamp head
 
 # Show current migration status
 migration-status: check_docker
@@ -457,10 +467,10 @@ migration-status: check_docker
 	COMPOSE_FILES="-f docker-compose.yml"; \
 	if [ "$$REMOTE_DB" != "true" ]; then \
 		COMPOSE_FILES="$$COMPOSE_FILES -f docker-compose.local-db.yml"; \
-		if ! docker compose $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
+		if ! $(VEXA_COMPOSE) $$COMPOSE_FILES ps postgres | grep -q "Up"; then \
 			echo "ERROR: PostgreSQL container is not running. Run 'make up' first."; \
 			exit 1; \
 		fi; \
-	fi
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini current
-	@docker compose $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini history --verbose
+	fi; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini current; \
+	$(VEXA_COMPOSE) $$COMPOSE_FILES exec -T transcription-collector alembic -c /app/alembic.ini history --verbose
