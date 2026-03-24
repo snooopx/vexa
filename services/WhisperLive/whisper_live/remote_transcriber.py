@@ -12,6 +12,7 @@ import tempfile
 import wave
 import logging
 import time
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from typing import BinaryIO, Iterable, List, Optional, Tuple, Union
 import numpy as np
 import httpx
@@ -19,6 +20,24 @@ import httpx
 from .transcriber import Segment, TranscriptionInfo, TranscriptionOptions, VadOptions
 
 logger = logging.getLogger(__name__)
+
+
+def _is_deepgram_api(api_url: str) -> bool:
+    """Check if the API URL is Deepgram's pre-recorded listen endpoint."""
+    if not api_url:
+        return False
+    return "deepgram" in api_url.lower()
+
+
+def _build_url_with_params(base_url: str, params: dict) -> str:
+    """Merge params into base URL, overriding any existing query params."""
+    parsed = urlparse(base_url)
+    existing = parse_qs(parsed.query, keep_blank_values=True)
+    merged = {k: v[0] if len(v) == 1 else v for k, v in existing.items()}
+    merged.update(params)
+    new_query = urlencode({k: v for k, v in merged.items() if v is not None})
+    return urlunparse(parsed._replace(query=new_query))
+
 
 # Busy/overload signal from remote API. We intentionally bubble this up so the caller
 # (WhisperLive server) can keep buffering and transcribe the *latest* audio window
@@ -269,53 +288,62 @@ class RemoteTranscriber:
         """
         retry_count = 0
         last_exception = None
-        
-        # Prepare headers
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "X-Transcription-Tier": self.transcription_tier,
-        }
-        
-        # Prepare form data
-        data = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "transcription_tier": self.transcription_tier,
-        }
-        
-        if self.vad_model:
-            data["vad_model"] = self.vad_model
-        
-        if language:
-            data["language"] = language
-        
-        if prompt:
-            data["prompt"] = prompt
-        
-        if task == "translate":
-            data["task"] = task
-        
-        # Add response_format if supported (some APIs may ignore this)
-        if self.response_format:
-            data["response_format"] = self.response_format
-        
-        if self.timestamp_granularities:
-            data["timestamp_granularities"] = self.timestamp_granularities
-        
-        # Log request details (masked)
-        auth_header_masked = f"Bearer {self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "Bearer ***"
-        
+        is_deepgram = _is_deepgram_api(self.api_url)
+
+        if is_deepgram:
+            # Deepgram pre-recorded API: raw binary body + query params
+            # https://developers.deepgram.com/docs/pre-recorded-audio#transcribe-a-local-file
+            params: dict = {"smart_format": "true"}
+            if self.model and self.model != "default":
+                params["model"] = self.model
+            if language:
+                params["language"] = language
+            request_url = _build_url_with_params(self.api_url, params)
+            headers = {
+                "Authorization": f"Token {self.api_key}",
+                "Content-Type": "audio/wav",
+            }
+        else:
+            # OpenAI-compatible (Vexa, Fireworks, Groq): multipart form
+            headers = {
+                "Authorization": f"Token {self.api_key}",
+                "X-Transcription-Tier": self.transcription_tier,
+            }
+            data = {
+                "model": self.model,
+                "temperature": self.temperature,
+                "transcription_tier": self.transcription_tier,
+            }
+            if self.vad_model:
+                data["vad_model"] = self.vad_model
+            if language:
+                data["language"] = language
+            if prompt:
+                data["prompt"] = prompt
+            if task == "translate":
+                data["task"] = task
+            if self.response_format:
+                data["response_format"] = self.response_format
+            if self.timestamp_granularities:
+                data["timestamp_granularities"] = self.timestamp_granularities
+            request_url = self.api_url
+
         while retry_count <= self.max_retries:
             try:
-                # Use in-memory file upload for better performance
-                files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
-                
-                response = self.http_client.post(
-                    self.api_url,
-                    headers=headers,
-                    files=files,
-                    data=data,
-                )
+                if is_deepgram:
+                    response = self.http_client.post(
+                        request_url,
+                        headers=headers,
+                        content=audio_bytes,
+                    )
+                else:
+                    files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+                    response = self.http_client.post(
+                        request_url,
+                        headers=headers,
+                        files=files,
+                        data=data,
+                    )
                 
                 # IMPORTANT: Don't block inside this call on overload/busy.
                 # WhisperLive already buffers/coalesces audio; we want the caller to keep
@@ -331,7 +359,7 @@ class RemoteTranscriber:
                         retry_after_s=retry_after,
                         detail=response.text[:500] if response.text else "",
                     )
-                
+                logger.warning(f"RemoteTranscriber response: {response.text[:1000]}")
                 response.raise_for_status()
                 
                 # Parse response
@@ -423,11 +451,67 @@ class RemoteTranscriber:
             List of Segment objects.
         """
         segments = []
-        
+
+        # Deepgram format: results.channels[0].alternatives[0]
+        # https://developers.deepgram.com/docs/pre-recorded-audio#analyze-the-response
+        dg_results = api_response.get("results", {})
+        dg_channels = dg_results.get("channels", []) if isinstance(dg_results, dict) else []
+        if dg_channels:
+            dg_meta = api_response.get("metadata", {}) or {}
+            duration = _to_float(dg_meta.get("duration"), default=0.0)
+            for ch_idx, channel in enumerate(dg_channels):
+                alts = channel.get("alternatives", [])
+                if not alts:
+                    continue
+                alt = alts[0]
+                transcript = (alt.get("transcript") or "").strip()
+                if not transcript:
+                    continue
+                dg_words = alt.get("words") or []
+                dg_paragraphs = (alt.get("paragraphs") or {}).get("paragraphs") or []
+                if dg_paragraphs:
+                    for p in dg_paragraphs:
+                        for sent in p.get("sentences", []):
+                            sent_text = (sent.get("text") or "").strip()
+                            if not sent_text:
+                                continue
+                            start = _to_float(sent.get("start"), default=0.0)
+                            end = _to_float(sent.get("end"), default=start + 0.5)
+                            segments.append(Segment(
+                                id=segment_id_start + len(segments),
+                                seek=0,
+                                start=start,
+                                end=end,
+                                text=sent_text,
+                                tokens=[],
+                                avg_logprob=-0.5,
+                                compression_ratio=1.0,
+                                no_speech_prob=0.0,
+                                words=None,
+                                temperature=float(self.temperature),
+                            ))
+                else:
+                    start = _to_float(dg_words[0].get("start"), default=0.0) if dg_words else 0.0
+                    end = _to_float(dg_words[-1].get("end"), default=duration) if dg_words else max(duration, 0.5)
+                    segments.append(Segment(
+                        id=segment_id_start,
+                        seek=0,
+                        start=start,
+                        end=end,
+                        text=transcript,
+                        tokens=[],
+                        avg_logprob=-0.5,
+                        compression_ratio=1.0,
+                        no_speech_prob=0.0,
+                        words=None,
+                        temperature=float(self.temperature),
+                    ))
+            if segments:
+                return segments
+
         # Check if response has segments array (verbose_json format)
         api_segments = api_response.get("segments", [])
-        
-        
+
         if not api_segments:
             # If no segments, check if there's just text
             text = api_response.get("text", "")
